@@ -5,26 +5,18 @@ const path = require('path');
 const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Required for Render
+const PORT = process.env.PORT || 10000; 
 
-// Update this with your actual Framer URL once published
-const ALLOWED_ORIGINS = [
-    "http://localhost:8000",
-    "https://your-project-name.framer.app" 
-];
+// Use your environment variable for CORS
+const ALLOWED_ORIGINS = [process.env.FRAMER_URL, "http://localhost:8000"];
 
-app.use(cors({
-    origin: ALLOWED_ORIGINS,
-    credentials: true
-}));
-
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
-const CLIENT_ID = '1023798264361-bt4mf5dluol0cc2lvouc4hnssvu7ltn4.apps.googleusercontent.com';
+const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const client = new OAuth2Client(CLIENT_ID);
 const USERS_FILE = path.join(__dirname, 'users.json');
 
-// Helper to read/write users
 function readUsers() {
     try {
         if (!fs.existsSync(USERS_FILE)) return {};
@@ -36,45 +28,65 @@ function writeUsers(users) {
     fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
 }
 
-// Routes
+// 1. GOOGLE LOGIN - Now checks for missing phone number
 app.post('/api/auth/google', async (req, res) => {
-    const { credential, phoneNumber } = req.body;
+    const { credential } = req.body;
     try {
-        const ticket = await client.verifyIdToken({
-            idToken: credential,
-            audience: CLIENT_ID,
-        });
+        const ticket = await client.verifyIdToken({ idToken: credential, audience: CLIENT_ID });
         const payload = ticket.getPayload();
         const userid = payload['sub'];
-        const { email, name, picture } = payload;
-
         const users = readUsers();
         let userToken = `token_${userid}`;
 
         if (!users[userToken]) {
-            users[userToken] = { internalId: userid, name, email, phoneNumber: phoneNumber || null, picture, createdAt: new Date().toISOString() };
-        } else {
-            users[userToken].lastLogin = new Date().toISOString();
+            users[userToken] = { 
+                internalId: userid, 
+                name: payload.name, 
+                email: payload.email, 
+                phoneNumber: null, // Always missing initially
+                picture: payload.picture 
+            };
         }
-
         writeUsers(users);
-        res.json({ success: true, token: userToken, profileIncomplete: !users[userToken].phoneNumber, user: { name, email, picture } });
+
+        res.json({ 
+            success: true, 
+            token: userToken, 
+            profileIncomplete: !users[userToken].phoneNumber // Tells Framer to show phone input
+        });
     } catch (error) {
-        res.status(401).json({ success: false, error: "Invalid Token" });
+        res.status(401).json({ success: false });
     }
 });
 
+// 2. NEW: UPDATE PHONE NUMBER
+app.post('/api/user/update-phone', (req, res) => {
+    const { token, phoneNumber } = req.body;
+    const users = readUsers();
+
+    if (!users[token]) return res.status(401).json({ success: false });
+
+    users[token].phoneNumber = phoneNumber;
+    writeUsers(users);
+    res.json({ success: true });
+});
+
+// 3. HUBBLE SSO - Returns the 3 mandatory parameters
 app.get('/hubble/sso/:token', (req, res) => {
     const users = readUsers();
     const user = users[req.params.token];
-    if (user) {
-        res.json({ success: true, user });
+    if (user && user.phoneNumber) {
+        res.json({
+            success: true,
+            user: {
+                id: user.internalId, // Mandatory
+                name: user.name,     // Mandatory
+                phoneNumber: user.phoneNumber // Mandatory
+            }
+        });
     } else {
-        res.status(401).json({ success: false, error: "Invalid Token" });
+        res.status(404).json({ success: false, error: "User incomplete" });
     }
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Backend running on port ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`Server on ${PORT}`));
