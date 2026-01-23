@@ -5,142 +5,53 @@ const path = require('path');
 const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
-const PORT = process.env.PORT || 10000; 
-
-// 1. IMPROVED CORS: Explicitly allow your Framer domain
-const ALLOWED_ORIGINS = [
-    "https://faida.framer.website", // Your live site
-    "http://localhost:3000",        // Local testing
-    process.env.FRAMER_URL          // From Render environment variables
-];
-
-app.use(cors({ 
-    origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl)
-        if (!origin) return callback(null, true);
-        if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            console.log("CORS blocked for origin:", origin);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true 
-}));
-
-app.use(express.json());
-
-// 2. GOOGLE AUTH SETUP
-const CLIENT_ID = process.env.GOOGLE_CLIENT_ID; // Must match Google Console
+const PORT = process.env.PORT || 10000;
+const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const client = new OAuth2Client(CLIENT_ID);
 const USERS_FILE = path.join(__dirname, 'users.json');
 
-// Helper to handle data persistence on Render
-function readUsers() {
-    try {
-        if (!fs.existsSync(USERS_FILE)) return {};
-        const data = fs.readFileSync(USERS_FILE, 'utf8');
-        return JSON.parse(data || '{}');
-    } catch (err) { 
-        console.error("Error reading users file:", err);
-        return {}; 
-    }
-}
+app.use(cors({ origin: ["https://faida.framer.website", "http://localhost:3000"], credentials: true }));
+app.use(express.json());
 
-function writeUsers(users) {
-    try {
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-    } catch (err) {
-        console.error("Error writing users file:", err);
-    }
-}
+const readUsers = () => JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '{}');
+const writeUsers = (u) => fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2));
 
-// --- API ROUTES ---
-
-// 1. GOOGLE LOGIN
 app.post('/api/auth/google', async (req, res) => {
-    console.log("Login attempt received...");
-    const { credential } = req.body;
-    
     try {
-        const ticket = await client.verifyIdToken({ 
-            idToken: credential, 
-            audience: CLIENT_ID 
-        });
+        const ticket = await client.verifyIdToken({ idToken: req.body.credential, audience: CLIENT_ID });
         const payload = ticket.getPayload();
-        const userid = payload['sub'];
-        
-        console.log(`User verified: ${payload.name} (${userid})`);
-        
         const users = readUsers();
-        let userToken = `token_${userid}`;
+        const token = `token_${payload['sub']}`;
 
-        if (!users[userToken]) {
-            users[userToken] = { 
-                internalId: userid, 
-                name: payload.name, 
-                email: payload.email, 
-                phoneNumber: null, // Mandatory for Hubble
-                picture: payload.picture 
-            };
-            console.log("New user created in users.json");
+        if (!users[token]) {
+            users[token] = { internalId: payload['sub'], name: payload.name, phoneNumber: null };
+            writeUsers(users);
         }
-        
-        writeUsers(users);
 
-        res.json({ 
-            success: true, 
-            token: userToken, 
-            profileIncomplete: !users[userToken].phoneNumber // Triggers Phone Input in Framer
-        });
-    } catch (error) {
-        console.error("Google Auth Error:", error);
-        res.status(401).json({ success: false, error: "Invalid Google token" });
-    }
+        res.json({ success: true, token, profileIncomplete: !users[token].phoneNumber });
+    } catch (e) { res.status(401).json({ success: false }); }
 });
 
-// 2. UPDATE PHONE NUMBER
 app.post('/api/user/update-phone', (req, res) => {
     const { token, phoneNumber } = req.body;
-    console.log(`Received phone update for token: ${token}`);
-    
     const users = readUsers();
-
-    if (!users[token]) {
-        return res.status(401).json({ success: false, error: "User session not found" });
-    }
-
-    users[token].phoneNumber = phoneNumber;
-    writeUsers(users);
-    
-    console.log(`Phone number updated successfully for ${users[token].name}`);
-    res.json({ success: true });
+    if (users[token]) {
+        users[token].phoneNumber = phoneNumber;
+        writeUsers(users);
+        res.json({ success: true });
+    } else res.status(404).json({ success: false });
 });
 
-// 3. HUBBLE SSO HANDSHAKE
 app.get('/hubble/sso/:token', (req, res) => {
-    const users = readUsers();
-    const user = users[req.params.token];
-    
+    const user = readUsers()[req.params.token];
     if (user && user.phoneNumber) {
-        console.log(`Providing Hubble SSO data for user: ${user.name}`);
-        res.json({
-            success: true,
-            user: {
-                id: user.internalId, // Mandatory
-                name: user.name,     // Mandatory
-                phoneNumber: user.phoneNumber // Mandatory
-            }
-        });
-    } else {
-        console.log("Hubble SSO failed: User incomplete or not found");
-        res.status(404).json({ success: false, error: "User incomplete" });
-    }
+        res.json({ success: true, user: { id: user.internalId, name: user.name, phoneNumber: user.phoneNumber } });
+    } else res.status(404).json({ success: false });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`=================================`);
-    console.log(`FAIDA Backend running on port ${PORT}`);
-    console.log(`CORS allowed for: ${ALLOWED_ORIGINS.join(", ")}`);
-    console.log(`=================================`);
+app.get('/debug/clear-users', (req, res) => {
+    writeUsers({});
+    res.send("Database cleared.");
 });
+
+app.listen(PORT, '0.0.0.0', () => console.log(`Server live on ${PORT}`));
